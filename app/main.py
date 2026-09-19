@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import date
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .gs1 import GS1ParseError, parse
 from .pickplan import DemandValidationError, pick_plan
@@ -16,7 +18,7 @@ from .summary import WeightSummaryError, summarize
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -29,7 +31,12 @@ app = FastAPI(
         "grouped by GTIN and batch, using exact Decimal arithmetic. "
         "POST /weight-pick-plan aggregates scans by GTIN, batch and expiry "
         "and fulfils per-GTIN weight demands in FEFO order (earliest AI 17 "
-        "expiry first), allowing a partial final allocation."
+        "expiry first), allowing a partial final allocation. Each request "
+        "carries a planning date as_of and every demand a non-negative "
+        "min_remaining_days (default 0): only stock whose actual expiry "
+        "date is on or after as_of + min_remaining_days may serve that "
+        "demand, and the weight ruled out by that threshold is reported "
+        "per demand as excluded_weight."
     ),
 )
 
@@ -136,6 +143,17 @@ class Demand(BaseModel):
         description="Required net weight, expressed in target_unit.",
         examples=[3.5],
     )
+    min_remaining_days: int = Field(
+        default=0,
+        description=(
+            "Minimum remaining shelf life in days, counted from as_of. Only "
+            "stock whose actual AI 17 expiry date is on or after "
+            "as_of + min_remaining_days may serve this demand; the boundary "
+            "date itself is eligible. Must be a non-negative integer; a "
+            "negative value is rejected with 422 naming the demand_index."
+        ),
+        examples=[30],
+    )
 
 
 class WeightPickPlanRequest(BaseModel):
@@ -160,6 +178,18 @@ class WeightPickPlanRequest(BaseModel):
             '"kg" or "lb" (default "kg").'
         ),
     )
+    as_of: date = Field(
+        ...,
+        title="Planning reference date",
+        description=(
+            "Planning date in YYYY-MM-DD form; must be a real calendar date "
+            "(invalid values are rejected with 422). Per demand, stock is "
+            "eligible only when its actual AI 17 expiry date -- day 00 "
+            "meaning the last day of the month -- is on or after "
+            "as_of + min_remaining_days."
+        ),
+        examples=["2025-01-15"],
+    )
     demands: list[Demand] = Field(
         ...,
         description=(
@@ -168,6 +198,18 @@ class WeightPickPlanRequest(BaseModel):
         ),
         examples=[[{"gtin": "09501101530003", "quantity": 3}]],
     )
+
+    @field_validator("as_of", mode="before")
+    @classmethod
+    def _as_of_is_yyyy_mm_dd(cls, value: Any) -> Any:
+        """Accept only a YYYY-MM-DD string (or an already-parsed date)."""
+        if isinstance(value, date):
+            return value
+        if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", value
+        ):
+            raise ValueError("as_of must be a date string in YYYY-MM-DD format")
+        return value
 
 
 class Allocation(BaseModel):
@@ -200,6 +242,13 @@ class DemandPlan(BaseModel):
     )
     shortage: float = Field(
         description="quantity - fulfilled; 0.000000 when fully satisfied (six decimal places)"
+    )
+    excluded_weight: float = Field(
+        description=(
+            "Total weight of this GTIN's stock ruled out by the "
+            "as_of + min_remaining_days threshold, in the target unit "
+            "(six decimal places)"
+        )
     )
     allocations: list[Allocation]
 
@@ -285,6 +334,7 @@ def _build_pick_plan_response(result: dict) -> Response:
                 "quantity": _six(demand["quantity"]),
                 "fulfilled": _six(demand["fulfilled"]),
                 "shortage": _six(demand["shortage"]),
+                "excluded_weight": _six(demand["excluded_weight"]),
                 "allocations": [
                     {
                         "batch": allocation["batch"],
@@ -335,7 +385,8 @@ def weight_pick_plan(req: WeightPickPlanRequest) -> Response:
         result = pick_plan(
             req.scans,
             req.target_unit,
-            [(d.gtin, d.quantity) for d in req.demands],
+            [(d.gtin, d.quantity, d.min_remaining_days) for d in req.demands],
+            req.as_of,
         )
     except (WeightSummaryError, DemandValidationError) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
