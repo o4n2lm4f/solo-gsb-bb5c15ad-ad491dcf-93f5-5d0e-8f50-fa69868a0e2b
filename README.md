@@ -295,7 +295,7 @@ curl -X POST http://localhost:8080/weight-summary \
 一次提交多条扫码字符串和一组按 GTIN 的需求，按 **FEFO（先到期先出）** 为每个
 需求分配净重。
 
-- 请求体：`{"scans": [...], "target_unit": "kg", "demands": [{"gtin": "...", "quantity": 5}]}`。
+- 请求体：`{"scans": [...], "target_unit": "kg", "as_of": "2025-02-01", "demands": [{"gtin": "...", "quantity": 5, "min_remaining_days": 30}]}`。
   `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`scans` 中的每一项既可以是
   元素串，也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
 - 每条扫描必须包含**恰好一个 AI 01**、**恰好一个 AI 17**（效期）、**零个或一个
@@ -304,8 +304,16 @@ curl -X POST http://localhost:8080/weight-summary \
   `detail.scan_index` 给出出错下标（从 0 开始），`detail.error` 为该条扫描的原始
   错误（结构同 `/parse`）。
 - `demands` 每项含 `gtin` 与 `quantity`（`quantity` 以 `target_unit` 计，必须大于 0，
-  按 `Decimal` 精确解析，JSON number 与字符串均可）。**同一 GTIN 重复出现返回
-  `422`**，`detail.demand_index` 给出出错下标。
+  按 `Decimal` 精确解析，JSON number 与字符串均可），以及可选的
+  `min_remaining_days`（**非负整数，默认 0**）。**同一 GTIN 重复出现返回
+  `422`**，`detail.demand_index` 给出出错下标；`min_remaining_days` 为负数时同样
+  返回 `422` 并以 `detail.demand_index` 定位出错需求。
+- `as_of` 可选，格式 **`YYYY-MM-DD`**；无效日期（含不存在的日期、非该格式的
+  字符串）返回 `422`。给定 `as_of` 时，每条需求仅允许**实际效期不早于
+  `as_of + min_remaining_days` 天**的库存参与分配（边界日期当天可用；AI 17 日
+  字段 `00` 仍按当月最后一天解释）。被门槛排除的库存**不计入 `fulfilled`**，
+  缺口照常进入 `shortage`。未给 `as_of` 时不做效期门槛过滤，
+  `min_remaining_days` 不起作用。
 - 汇总：先按 **GTIN + 批号 + AI 17 原值** 汇总可用重量（换算到 `target_unit`），
   再对每个需求的 GTIN 按 **AI 17 实际日期升序**执行 FEFO——日字段 `00` 视为当月
   最后一天（如 `250200` = 2025-02-28，闰年 `240200` = 2024-02-29）；实际日期相同的
@@ -314,10 +322,12 @@ curl -X POST http://localhost:8080/weight-summary \
   **1 lb = 0.45359237 kg**（千克→磅按其精确倒数换算），仅在响应时按**六位小数
   half-even（银行家舍入）**输出为 JSON 数字（如 `2.513000`）。
 - 响应：`target_unit` 加与请求同序的 `demands` 数组。每项含 `gtin`、`quantity`
-  （回显）、`fulfilled`（已分配总量）、`shortage`（缺口，`quantity - fulfilled`）与
-  `allocations`（按分配顺序，每条含 `batch`、`expiry`（AI 17 原值 YYMMDD）与
-  `weight`）。`scans` 为空数组时每个需求都是全额 `shortage`（`fulfilled` 为
-  `0.000000`，`allocations` 为空）。
+  （回显）、`fulfilled`（已分配总量）、`shortage`（缺口，`quantity - fulfilled`）、
+  `excluded_weight`（同 GTIN 因 `as_of + min_remaining_days` 门槛被排除的总重量，
+  以 `target_unit` 计，无 `as_of` 或无排除时为 `0.000000`）与 `allocations`
+  （按分配顺序，每条含 `batch`、`expiry`（AI 17 原值 YYMMDD）与 `weight`）。
+  `scans` 为空数组时每个需求都是全额 `shortage`（`fulfilled` 为 `0.000000`，
+  `allocations` 为空）。
 
 请求示例（三个批次效期不同，需求 12 kg，目标单位 kg）：
 
@@ -339,9 +349,38 @@ curl -X POST http://localhost:8080/weight-pick-plan \
       "quantity": 12.000000,
       "fulfilled": 12.000000,
       "shortage": 0.000000,
+      "excluded_weight": 0.000000,
       "allocations": [
         {"batch": "EARLY", "expiry": "250131", "weight": 2.000000},
         {"batch": "MID",   "expiry": "250228", "weight": 10.000000}
+      ]
+    }
+  ]
+}
+```
+
+带剩余效期门槛的示例：`as_of` 为 2025-02-01、`min_remaining_days` 为 0 时，
+2025-01-31 到期的 `OLD` 批次被排除（计入 `excluded_weight`），只有 `FRESH`
+批次参与分配，缺口进入 `shortage`：
+
+```bash
+curl -X POST http://localhost:8080/weight-pick-plan \
+  -H "Content-Type: application/json" \
+  -d '{"as_of": "2025-02-01", "scans": ["01095011015300031725013110OLD3103002000", "01095011015300031725033110FRESH3103002000"], "demands": [{"gtin": "09501101530003", "quantity": 3, "min_remaining_days": 0}]}'
+```
+
+```json
+{
+  "target_unit": "kg",
+  "demands": [
+    {
+      "gtin": "09501101530003",
+      "quantity": 3.000000,
+      "fulfilled": 2.000000,
+      "shortage": 1.000000,
+      "excluded_weight": 2.000000,
+      "allocations": [
+        {"batch": "FRESH", "expiry": "250331", "weight": 2.000000}
       ]
     }
   ]
@@ -357,7 +396,7 @@ curl -X POST http://localhost:8080/weight-pick-plan \
 ```
 
 ```json
-{"target_unit": "kg", "demands": [{"gtin": "09501101530003", "quantity": 2.500000, "fulfilled": 0.000000, "shortage": 2.500000, "allocations": []}]}
+{"target_unit": "kg", "demands": [{"gtin": "09501101530003", "quantity": 2.500000, "fulfilled": 0.000000, "shortage": 2.500000, "excluded_weight": 0.000000, "allocations": []}]}
 ```
 
 扫描错误与 `/weight-summary` 同形（`detail.scan_index` + 原始错误）；需求中 GTIN
@@ -376,6 +415,25 @@ curl -X POST http://localhost:8080/weight-pick-plan \
   }
 }
 ```
+
+`min_remaining_days` 为负数时同样返回 `422` 并定位 `demand_index`：
+
+```json
+{
+  "detail": {
+    "demand_index": 1,
+    "error": {
+      "error": "INVALID_MIN_REMAINING_DAYS",
+      "message": "demand 1: min_remaining_days must be a non-negative integer, got -5",
+      "expected": "non-negative integer min_remaining_days",
+      "found": -5
+    }
+  }
+}
+```
+
+`as_of` 不是合法的 `YYYY-MM-DD` 日期时返回 `422`（请求体校验错误，`loc` 指向
+`["body", "as_of"]`）。
 
 ## 错误响应
 
@@ -434,7 +492,7 @@ app/
   main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
-  pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、按实际效期分配需求
+  pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、按实际效期与剩余效期门槛分配需求
 tests/
   test_parse.py
   test_weight_summary.py

@@ -14,10 +14,12 @@ GTIN_OK = "09501101530003"  # valid Mod-10 check digit
 GTIN2 = "00000000000017"  # second valid GTIN
 
 
-def plan(scans, demands, target_unit=None):
+def plan(scans, demands, target_unit=None, as_of=None):
     body = {"scans": scans, "demands": demands}
     if target_unit is not None:
         body["target_unit"] = target_unit
+    if as_of is not None:
+        body["as_of"] = as_of
     return client.post("/weight-pick-plan", json=body)
 
 
@@ -33,8 +35,11 @@ def scan(gtin=GTIN_OK, expiry="250131", batch=None, weight="3103002000"):
     return "".join(parts)
 
 
-def demand(gtin=GTIN_OK, quantity="1"):
-    return {"gtin": gtin, "quantity": quantity}
+def demand(gtin=GTIN_OK, quantity="1", min_remaining_days=None):
+    d = {"gtin": gtin, "quantity": quantity}
+    if min_remaining_days is not None:
+        d["min_remaining_days"] = min_remaining_days
+    return d
 
 
 # ---------------------------------------------------------------- happy path
@@ -220,7 +225,14 @@ def test_response_shape():
     body = resp.json()
     assert set(body) == {"target_unit", "demands"}
     d = body["demands"][0]
-    assert set(d) == {"gtin", "quantity", "fulfilled", "shortage", "allocations"}
+    assert set(d) == {
+        "gtin",
+        "quantity",
+        "fulfilled",
+        "shortage",
+        "excluded_weight",
+        "allocations",
+    }
     assert set(d["allocations"][0]) == {"batch", "expiry", "weight"}
 
 
@@ -260,6 +272,156 @@ def test_mixed_units_aggregate_before_allocation():
 def test_default_target_unit_is_kg():
     resp = plan([scan()], [demand(quantity="1")])
     assert resp.json()["target_unit"] == "kg"
+
+
+# ------------------------------------------------- shelf-life threshold
+
+
+def test_as_of_excludes_inventory_expiring_before_threshold():
+    resp = plan(
+        [scan(batch="OLD", expiry="250131"), scan(batch="FRESH", expiry="250228")],
+        [demand(quantity="3")],
+        as_of="2025-02-01",
+    )
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    # OLD (2025-01-31) is before as_of and cannot fulfil the demand.
+    assert d["allocations"] == [{"batch": "FRESH", "expiry": "250228", "weight": 2.0}]
+    assert d["fulfilled"] == 2.0
+    assert d["shortage"] == 1.0
+    assert d["excluded_weight"] == 2.0
+
+
+def test_expiry_on_threshold_boundary_is_eligible():
+    # as_of 2025-01-15 + 16 days = 2025-01-31: the boundary date itself is usable.
+    resp = plan(
+        [scan(batch="EDGE", expiry="250131")],
+        [demand(quantity="2", min_remaining_days=16)],
+        as_of="2025-01-15",
+    )
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 2.0
+    assert d["shortage"] == 0.0
+    assert d["excluded_weight"] == 0.0
+
+
+def test_one_day_beyond_boundary_is_excluded():
+    # as_of 2025-01-15 + 17 days = 2025-02-01: 2025-01-31 no longer qualifies.
+    resp = plan(
+        [scan(batch="EDGE", expiry="250131")],
+        [demand(quantity="2", min_remaining_days=17)],
+        as_of="2025-01-15",
+    )
+    d = resp.json()["demands"][0]
+    assert d["allocations"] == []
+    assert d["fulfilled"] == 0.0
+    assert d["shortage"] == 2.0
+    assert d["excluded_weight"] == 2.0
+
+
+def test_min_remaining_days_defaults_to_zero():
+    # Without the field the threshold is as_of itself; expiry on as_of qualifies.
+    resp = plan([scan(expiry="250131")], [demand(quantity="2")], as_of="2025-01-31")
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 2.0
+    assert d["excluded_weight"] == 0.0
+
+
+def test_min_remaining_days_without_as_of_filters_nothing():
+    resp = plan([scan(expiry="250131")], [demand(quantity="2", min_remaining_days=90)])
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 2.0
+    assert d["excluded_weight"] == 0.0
+
+
+def test_day_00_expiry_compares_as_month_end():
+    # 250200 is 2025-02-28: it survives a 2025-02-28 threshold but not 2025-03-01.
+    resp = plan([scan(expiry="250200")], [demand(quantity="2")], as_of="2025-02-28")
+    assert resp.json()["demands"][0]["fulfilled"] == 2.0
+    resp = plan([scan(expiry="250200")], [demand(quantity="2")], as_of="2025-03-01")
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 0.0
+    assert d["excluded_weight"] == 2.0
+
+
+def test_day_00_leap_year_month_end_against_threshold():
+    # 240200 is 2024-02-29 (leap year): eligible on 2024-02-29, not on 2024-03-01.
+    resp = plan([scan(expiry="240200")], [demand(quantity="2")], as_of="2024-02-29")
+    assert resp.json()["demands"][0]["fulfilled"] == 2.0
+    resp = plan([scan(expiry="240200")], [demand(quantity="2")], as_of="2024-03-01")
+    assert resp.json()["demands"][0]["excluded_weight"] == 2.0
+
+
+def test_excluded_weight_sums_all_excluded_groups():
+    resp = plan(
+        [
+            scan(batch="E1", expiry="250131"),
+            scan(batch="E2", expiry="250200"),  # 2025-02-28
+            scan(batch="K1", expiry="250331"),
+            scan(batch="K2", expiry="250331", weight="3103001000"),
+        ],
+        [demand(quantity="2.5")],
+        as_of="2025-03-01",
+    )
+    d = resp.json()["demands"][0]
+    assert d["excluded_weight"] == 4.0  # E1 (2 kg) + E2 (2 kg)
+    # eligible groups keep FEFO / first-seen order and allow a partial take
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [
+        ("K1", 2.0),
+        ("K2", 0.5),
+    ]
+    assert d["fulfilled"] == 2.5
+    assert d["shortage"] == 0.0
+
+
+def test_excluded_weight_converts_units_and_rounds_half_even():
+    # 25.13 lb = 11.3987762581 kg -> 11.398776 at six places.
+    resp = plan([scan(weight="3202002513")], [demand(quantity="1")], as_of="2025-02-01")
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 0.0
+    assert d["shortage"] == 1.0
+    assert d["excluded_weight"] == 11.398776
+    assert '"excluded_weight":11.398776' in resp.text
+
+
+def test_excluded_weight_is_zero_without_as_of():
+    resp = plan([scan()], [demand(quantity="1")])
+    assert '"excluded_weight":0.000000' in resp.text
+
+
+def test_thresholds_are_per_demand():
+    resp = plan(
+        [scan(expiry="250131"), scan(gtin=GTIN2, expiry="250131")],
+        [
+            demand(quantity="2", min_remaining_days=60),  # threshold 2025-04-01
+            demand(gtin=GTIN2, quantity="2"),  # threshold 2025-01-31
+        ],
+        as_of="2025-01-31",
+    )
+    first, second = resp.json()["demands"]
+    assert first["fulfilled"] == 0.0
+    assert first["shortage"] == 2.0
+    assert first["excluded_weight"] == 2.0
+    assert second["fulfilled"] == 2.0
+    assert second["excluded_weight"] == 0.0
+
+
+def test_pick_plan_direct_call_with_as_of():
+    from datetime import date
+
+    from app.pickplan import pick_plan
+
+    result = pick_plan(
+        [scan(expiry="250131"), scan(batch="B", expiry="250228")],
+        "kg",
+        [(GTIN_OK, Decimal("3"), 0)],
+        as_of=date(2025, 2, 1),
+    )
+    d = result["demands"][0]
+    assert d["excluded_weight"] == Decimal("2.000")
+    assert d["fulfilled"] == Decimal("2.000")
+    assert d["shortage"] == Decimal("1.000")
+    assert not isinstance(d["excluded_weight"], float)
 
 
 # ------------------------------------------------- exact Decimal arithmetic
@@ -385,6 +547,26 @@ def test_duplicate_demand_gtin_checked_before_scans():
     assert resp.json()["detail"]["error"]["error"] == "DUPLICATE_GTIN"
 
 
+def test_negative_min_remaining_days_rejected_with_demand_index():
+    resp = plan(
+        [scan()],
+        [demand(), demand(gtin=GTIN2, quantity="1", min_remaining_days=-1)],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["demand_index"] == 1
+    assert detail["error"]["error"] == "INVALID_MIN_REMAINING_DAYS"
+    assert detail["error"]["found"] == -1
+    assert set(detail) == {"demand_index", "error"}
+
+
+def test_negative_min_remaining_days_checked_before_scans():
+    resp = plan(["not-a-gs1-string"], [demand(min_remaining_days=-3)])
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["error"] == "INVALID_MIN_REMAINING_DAYS"
+    assert resp.json()["detail"]["demand_index"] == 0
+
+
 # ---------------------------------------------------- request model validation
 
 
@@ -407,6 +589,26 @@ def test_unknown_target_unit_is_422():
     resp = plan([], [demand()], target_unit="stone")
     assert resp.status_code == 422
     assert resp.json()["detail"][0]["loc"] == ["body", "target_unit"]
+
+
+def test_invalid_as_of_is_422():
+    for bad in (
+        "not-a-date",
+        "2025-13-01",  # no such month
+        "2025-02-30",  # no such day
+        "20250228",  # missing dashes
+        "2025-02-28T00:00:00",  # datetime, not a bare date
+        "28/02/2025",
+    ):
+        resp = plan([], [demand()], as_of=bad)
+        assert resp.status_code == 422, bad
+        assert resp.json()["detail"][0]["loc"] == ["body", "as_of"]
+
+
+def test_valid_as_of_boundary_dates_accepted():
+    # leap day and month-end are real dates and pass validation
+    assert plan([], [], as_of="2024-02-29").status_code == 200
+    assert plan([], [], as_of="2025-01-31").status_code == 200
 
 
 def test_non_string_scan_entry_is_422():

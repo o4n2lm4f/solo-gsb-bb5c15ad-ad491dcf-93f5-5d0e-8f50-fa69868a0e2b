@@ -20,6 +20,15 @@ original six digits and converted with the fixed factors of
 groups are walked by ascending *actual* expiry date (day ``00`` -> last
 day of the month), ties keep the batches' first-appearance order (the
 sort is stable), and the last group reached may be allocated partially.
+
+When the request carries an ``as_of`` date, each demand additionally
+declares a non-negative ``min_remaining_days`` threshold (default 0):
+only groups whose actual expiry date is on or after
+``as_of + min_remaining_days`` may fulfil that demand (the boundary
+date itself stays eligible).  Excluded groups never count towards
+``fulfilled`` -- the shortfall simply lands in ``shortage`` -- and
+their combined weight is reported per demand as ``excluded_weight``.
+
 All conversion, aggregation, comparison and allocation arithmetic stays
 in :class:`Decimal`; rounding to six places happens only when the
 response is rendered.
@@ -28,7 +37,7 @@ response is rendered.
 from __future__ import annotations
 
 import calendar
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, localcontext
 
 from .gs1 import GS1ParseError, Element, decode_weight, parse
@@ -66,6 +75,22 @@ def _expiry_date(yymmdd: str) -> date:
     if day == 0:
         day = calendar.monthrange(year, month)[1]
     return date(year, month, day)
+
+
+def _threshold_date(as_of: date | None, min_days: int) -> date | None:
+    """Earliest eligible actual expiry date for one demand.
+
+    ``None`` (no filtering) when the request carries no ``as_of``.  A
+    ``min_days`` so large that the addition overflows simply excludes
+    everything: AI 17 years are 20YY, so :data:`date.max` is beyond any
+    real expiry.
+    """
+    if as_of is None:
+        return None
+    try:
+        return as_of + timedelta(days=min_days)
+    except OverflowError:
+        return date.max
 
 
 def _extract(
@@ -144,10 +169,25 @@ def _extract(
     )
 
 
-def _check_demands(demands: list[tuple[str, Decimal]]) -> None:
-    """Reject a GTIN requested by more than one demand."""
+def _check_demands(demands: list[tuple[str, Decimal, int]]) -> None:
+    """Reject negative thresholds and GTINs requested more than once."""
     seen: dict[str, int] = {}
-    for demand_index, (gtin, _quantity) in enumerate(demands):
+    for demand_index, (gtin, _quantity, min_days) in enumerate(demands):
+        if min_days < 0:
+            raise DemandValidationError(
+                {
+                    "demand_index": demand_index,
+                    "error": {
+                        "error": "INVALID_MIN_REMAINING_DAYS",
+                        "message": (
+                            f"demand {demand_index}: min_remaining_days must "
+                            f"be a non-negative integer, got {min_days}"
+                        ),
+                        "expected": "non-negative integer min_remaining_days",
+                        "found": min_days,
+                    },
+                }
+            )
         if gtin in seen:
             first = seen[gtin]
             raise DemandValidationError(
@@ -169,19 +209,33 @@ def _check_demands(demands: list[tuple[str, Decimal]]) -> None:
 
 
 def pick_plan(
-    scans: list[str], target_unit: str, demands: list[tuple[str, Decimal]]
+    scans: list[str],
+    target_unit: str,
+    demands: list[tuple[str, Decimal] | tuple[str, Decimal, int]],
+    as_of: date | None = None,
 ) -> dict:
     """Aggregate scan weights per GTIN and satisfy each demand FEFO.
 
-    ``demands`` is a list of ``(gtin, quantity)`` pairs with ``quantity``
-    a :class:`Decimal` already expressed in ``target_unit``; a GTIN may
-    appear only once.  Returns ``{"target_unit": ..., "demands": [{gtin,
-    quantity, fulfilled, shortage, allocations}, ...]}`` in demand order,
-    where every numeric value is an unrounded :class:`Decimal` in the
-    target unit and each allocation is ``{"batch", "expiry", "weight"}``
-    with ``expiry`` the raw AI 17 value of the source group.
+    ``demands`` is a list of ``(gtin, quantity)`` or ``(gtin, quantity,
+    min_remaining_days)`` tuples with ``quantity`` a :class:`Decimal`
+    already expressed in ``target_unit``; a GTIN may appear only once
+    and ``min_remaining_days`` (default 0) must be a non-negative
+    integer.  When ``as_of`` is given, only groups whose actual expiry
+    date is on or after ``as_of + min_remaining_days`` may fulfil the
+    demand.  Returns ``{"target_unit": ..., "demands": [{gtin, quantity,
+    fulfilled, shortage, excluded_weight, allocations}, ...]}`` in
+    demand order, where every numeric value is an unrounded
+    :class:`Decimal` in the target unit and each allocation is
+    ``{"batch", "expiry", "weight"}`` with ``expiry`` the raw AI 17
+    value of the source group.  ``excluded_weight`` is the total weight
+    of the demand's GTIN held back by the shelf-life threshold (zero
+    when ``as_of`` is absent).
     """
-    _check_demands(demands)
+    normalized = [
+        (demand[0], demand[1], demand[2] if len(demand) > 2 else 0)
+        for demand in demands
+    ]
+    _check_demands(normalized)
 
     groups: dict[tuple[str, str | None, str], dict] = {}
     order: list[tuple[str, str | None, str]] = []
@@ -220,10 +274,19 @@ def pick_plan(
             gtin_groups.sort(key=lambda group: group["expiry_date"])
 
         results = []
-        for gtin, quantity in demands:
+        for gtin, quantity, min_days in normalized:
+            threshold = _threshold_date(as_of, min_days)
             remaining = quantity
+            excluded = Decimal(0)
             allocations = []
             for group in by_gtin.get(gtin, []):
+                if threshold is not None and group["expiry_date"] < threshold:
+                    # Not enough remaining shelf life for this demand: the
+                    # group never counts towards fulfilled.  Groups are
+                    # FEFO-sorted, so excluded ones form a prefix and all
+                    # of them are totalled here before allocation starts.
+                    excluded += group["available"]
+                    continue
                 if remaining <= 0:
                     break
                 take = min(remaining, group["available"])
@@ -243,6 +306,7 @@ def pick_plan(
                     "quantity": quantity,
                     "fulfilled": quantity - remaining,
                     "shortage": remaining,
+                    "excluded_weight": excluded,
                     "allocations": allocations,
                 }
             )
